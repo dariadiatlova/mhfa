@@ -3,24 +3,19 @@
 
 import argparse
 import datetime
-import glob
-import os
-import pdb
 import socket
-import sys
-import time
 import warnings
 import zipfile
+from contextlib import closing
+from pathlib import Path
+from shutil import rmtree
 
-import numpy
-import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import yaml
 from DatasetLoader import *
 from ser_dataset_loader import *
-from SpeakerNet import *
+from SERNet import *
 from tuneThreshold import *
 
 ## ===== ===== ===== ===== ===== ===== ===== =====
@@ -28,7 +23,7 @@ from tuneThreshold import *
 ## ===== ===== ===== ===== ===== ===== ===== =====
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
-parser = argparse.ArgumentParser(description="SpeakerNet")
+parser = argparse.ArgumentParser(description="SERNet")
 
 parser.add_argument("--config", type=str, default=None, help="Config YAML file")
 
@@ -48,8 +43,20 @@ parser.add_argument(
 parser.add_argument(
     "--batch_size",
     type=int,
-    default=400,
+    default=32,
     help="Batch size, number of speakers per batch",
+)
+parser.add_argument(
+    "--batch_length",
+    type=int,
+    default=80000,  # # 16000 * 5
+    help="Sample length in sample size for train samples",
+)
+parser.add_argument(
+    "--val_batch_length",
+    type=int,
+    default=176000,
+    help="Sample length in sample size for validation samples",
 )
 parser.add_argument(
     "--max_seg_per_spk",
@@ -62,7 +69,7 @@ parser.add_argument(
 )
 parser.add_argument("--augment", type=bool, default=True, help="Augment input")
 parser.add_argument(
-    "--seed", type=int, default=20211202, help="Seed for the random number generator"
+    "--seed", type=int, default=100, help="Seed for the random number generator"
 )
 
 ## Training details
@@ -144,16 +151,11 @@ parser.add_argument(
 parser.add_argument(
     "--scale", type=float, default=30, help="Loss scale, only for some loss functions"
 )
-parser.add_argument(
-    "--nPerSpeaker",
-    type=int,
-    default=1,
-    help="Number of utterances per speaker per batch, only for metric learning based losses",
-)
+
 parser.add_argument(
     "--nClasses",
     type=int,
-    default=5994,
+    default=4,
     help="Number of speakers in the softmax layer, only for softmax-based losses",
 )
 
@@ -176,50 +178,27 @@ parser.add_argument(
     "--initial_model", type=str, default="", help="Initial model weights"
 )
 parser.add_argument(
-    "--save_path", type=str, default="exps/exp1", help="Path for model and logs"
+    "--save_path",
+    type=str,
+    default="/app/data2/mhfa_training_logs",
+    help="Path for model and logs",
 )
 
 ## Training and test data
-## Training and test data
-parser.add_argument(
-    "--train_list",
-    type=str,
-    default="/mnt/proj3/open-24-5/pengjy_new/WavLM/vox_list/train_list.txt",
-    help="Train list",
-)
-parser.add_argument(
-    "--test_list",
-    type=str,
-    default="/mnt/proj3/open-24-5/pengjy_new/WavLM/vox_list/veri_test.txt",
-    help="Evaluation list",
-)
 
+# SER
 parser.add_argument(
     "--train_path",
     type=str,
-    default="/mnt/proj3/open-24-5/plchot/data_wav/16kHz/voxceleb2/dev/aac/",
-    help="Absolute path to the train set",
+    default="",
+    help="Path to the root dir with torch tensors.",
 )
 parser.add_argument(
-    "--test_path",
+    "--train_list",
     type=str,
-    default="/mnt/proj3/open-24-5/plchot/data_wav/16kHz/voxceleb_1.1/",
-    help="Absolute path to the test set",
+    default="",
+    help="Path to csv file with labels.",
 )
-parser.add_argument(
-    "--musan_path",
-    type=str,
-    default="/mnt/proj3/open-24-5/pengjy_new/musan_split/",
-    help="Absolute path to the test set",
-)
-parser.add_argument(
-    "--rir_path",
-    type=str,
-    default="/mnt/proj3/open-24-5/plchot/data_augment/16kHz/simulated_rirs/",
-    help="Absolute path to the test set",
-)
-
-# SER
 parser.add_argument(
     "--eval_session",
     type=str,
@@ -235,12 +214,11 @@ parser.add_argument(
 
 parser.add_argument(
     "--ds_size",
-    type=int,
-    default=16,
+    default=None,
     help="Size of the dataset used for training and evaluation",
 )
 parser.add_argument(
-    "--head-nb",
+    "--head_nb",
     type=int,
     default=16,
     help="Number of heads in MHFA",
@@ -248,24 +226,28 @@ parser.add_argument(
 
 ## Model definition
 parser.add_argument("--n_mels", type=int, default=80, help="Number of mel filterbanks")
+parser.add_argument(
+    "--num_workers", type=int, default=1, help="Number of workers for dataset"
+)
 parser.add_argument("--log_input", type=bool, default=False, help="Log input features")
+parser.add_argument(
+    "--save_ckpts", type=bool, default=False, help="if delete ckpts after test"
+)
 parser.add_argument("--model", type=str, default="", help="Name of model definition")
 parser.add_argument("--encoder_type", type=str, default="SAP", help="Type of encoder")
 parser.add_argument(
-    "--nOut", type=int, default=192, help="Embedding size in the last FC layer"
+    "--classes", type=list, default=[1, 2, 3, 4], help="Sequence of classes"
 )
+parser.add_argument("--random_crop", type=bool)
 
 ## For test only
 parser.add_argument("--eval", dest="eval", action="store_true", help="Eval only")
-
-## If train for Speech Emotion Recognition
-parser.add_argument("--ser", dest="ser", action="store_true", help="If train for SER")
 
 ## Distributed and mixed precision training
 parser.add_argument(
     "--port",
     type=str,
-    default="7888",
+    default="7889",
     help="Port for distributed training, input as text",
 )
 parser.add_argument(
@@ -298,7 +280,8 @@ if args.config is not None:
     for k, v in yml_config.items():
         if k in args.__dict__:
             typ = find_option_type(k, parser)
-            args.__dict__[k] = typ(v)
+            if typ is not None:
+                args.__dict__[k] = typ(v)
         else:
             sys.stderr.write("Ignored unknown parameter {} in yaml.\n".format(k))
 
@@ -318,64 +301,55 @@ warnings.simplefilter("ignore")
 ## ===== ===== ===== ===== ===== ===== ===== =====
 
 
-def main_worker(gpu, ngpus_per_node, args):
+def main_worker(gpu, ngpus_per_node, dist_url, args):
     args.gpu = gpu
 
     ## Load models
-    s = SpeakerNet(**vars(args))
+    s = SERNet(**vars(args))
 
     if args.distributed:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = args.port
-
         dist.init_process_group(
-            backend="nccl", world_size=ngpus_per_node, rank=args.gpu
+            backend="nccl",
+            init_method=dist_url,
+            world_size=ngpus_per_node,
+            rank=args.gpu,
         )
-
         torch.cuda.set_device(args.gpu)
         s.cuda(args.gpu)
-
         s = torch.nn.parallel.DistributedDataParallel(
             s, device_ids=[args.gpu], find_unused_parameters=True
         )
-
         print("Loaded the model on GPU {:d}".format(args.gpu))
-
     else:
         s = WrappedModel(s).cuda(args.gpu)
 
     it = 1
-    eers = [100]
+    best_balanced_accuracy = 0.0
+    best_ckpt_path = None
 
     if args.gpu == 0:
         ## Write args to scorefile
         scorefile = open(args.result_save_path + "/scores.txt", "a+")
 
     ## Initialise trainer and data loader
-    if args.ser:
-        dataloader_factory = DataloaderFactory(args)
-        train_loader = dataloader_factory.build(
-            size=args.ds_size, state="train", bs=args.batch_size
-        )
-        val_loader = dataloader_factory.build(
-            size=args.ds_size, state="val", bs=args.batch_size
-        )
-        test_loader = dataloader_factory.build(
-            size=args.ds_size, state="test", bs=args.batch_size
-        )
-    else:
-        train_dataset = train_dataset_loader(**vars(args))
-        train_sampler = train_dataset_sampler(train_dataset, **vars(args))
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            num_workers=args.nDataLoaderThread,
-            sampler=train_sampler,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn,
-            drop_last=True,
-        )
+    dataloader_factory = DataloaderFactory(args)
+    train_loader = dataloader_factory.build(
+        size=args.ds_size, state="train", bs=args.batch_size // ngpus_per_node
+    )
+    val_loader = dataloader_factory.build(
+        size=args.ds_size, state="val", bs=args.batch_size // ngpus_per_node
+    )
+    test_loader = dataloader_factory.build(
+        size=args.ds_size, state="test", bs=args.batch_size // ngpus_per_node
+    )
 
+    print(f"Train loader: {len(train_loader)}")
+    print(f"Val loader: {len(val_loader)}")
+    print(f"Test loader: {len(test_loader)}")
+
+    print(f"Initialized dataloaders")
     # trainLoader = get_data_loader(args.train_list, **vars(args));
     trainer = ModelTrainer(s, **vars(args))
 
@@ -398,48 +372,48 @@ def main_worker(gpu, ngpus_per_node, args):
 
     print("Total parameters: ", pytorch_total_params)
     ## Evaluation code - must run on single GPU
-    if args.eval == True:
-
-        print("Test list", args.test_list)
-
-        sc, lab, _, sc1, sc2 = trainer.evaluateFromList(**vars(args))
-
-        if args.gpu == 0:
-
-            result = tuneThresholdfromScore(sc, lab, [1, 0.1])
-            result_s1 = tuneThresholdfromScore(sc1, lab, [1, 0.1])
-            result_s2 = tuneThresholdfromScore(sc2, lab, [1, 0.1])
-
-            fnrs, fprs, thresholds = ComputeErrorRates(sc, lab)
-            mindcf, threshold = ComputeMinDcf(
-                fnrs,
-                fprs,
-                thresholds,
-                args.dcf_p_target,
-                args.dcf_c_miss,
-                args.dcf_c_fa,
-            )
-
-            print(
-                "\n",
-                time.strftime("%Y-%m-%d %H:%M:%S"),
-                "VEER {:2.4f}".format(result[1]),
-                "VEER_s1 {:2.4f}".format(result_s1[1]),
-                "VEER_s2 {:2.4f}".format(result_s2[1]),
-                "MinDCF {:2.5f}".format(mindcf),
-            )
-
-            if ("nsml" in sys.modules) and args.gpu == 0:
-                training_report = {}
-                training_report["summary"] = True
-                training_report["epoch"] = it
-                training_report["step"] = it
-                training_report["val_eer"] = result[1]
-                training_report["val_dcf"] = mindcf
-
-                nsml.report(**training_report)
-
-        return
+    # if args.eval == True:
+    #
+    #     print("Test list", args.test_list)
+    #
+    #     sc, lab, _, sc1, sc2 = trainer.evaluateFromList(**vars(args))
+    #
+    #     if args.gpu == 0:
+    #
+    #         result = tuneThresholdfromScore(sc, lab, [1, 0.1])
+    #         result_s1 = tuneThresholdfromScore(sc1, lab, [1, 0.1])
+    #         result_s2 = tuneThresholdfromScore(sc2, lab, [1, 0.1])
+    #
+    #         fnrs, fprs, thresholds = ComputeErrorRates(sc, lab)
+    #         mindcf, threshold = ComputeMinDcf(
+    #             fnrs,
+    #             fprs,
+    #             thresholds,
+    #             args.dcf_p_target,
+    #             args.dcf_c_miss,
+    #             args.dcf_c_fa,
+    #         )
+    #
+    #         print(
+    #             "\n",
+    #             time.strftime("%Y-%m-%d %H:%M:%S"),
+    #             "VEER {:2.4f}".format(result[1]),
+    #             "VEER_s1 {:2.4f}".format(result_s1[1]),
+    #             "VEER_s2 {:2.4f}".format(result_s2[1]),
+    #             "MinDCF {:2.5f}".format(mindcf),
+    #         )
+    #
+    #         if ("nsml" in sys.modules) and args.gpu == 0:
+    #             training_report = {}
+    #             training_report["summary"] = True
+    #             training_report["epoch"] = it
+    #             training_report["step"] = it
+    #             training_report["val_eer"] = result[1]
+    #             training_report["val_dcf"] = mindcf
+    #
+    #             nsml.report(**training_report)
+    #
+    #     return
 
     ## Save training code and params
     if args.gpu == 0:
@@ -458,48 +432,117 @@ def main_worker(gpu, ngpus_per_node, args):
 
     ## Core training script
     for it in range(it, args.max_epoch + 1):
-
-        train_sampler.set_epoch(it)
+        if args.distributed:
+            train_loader.set_epoch(it)
 
         clr = [x["lr"] for x in trainer.__optimizer__.param_groups]
 
-        loss, traineer = trainer.train_network(train_loader, verbose=(args.gpu == 0))
+        loss = trainer.train_network(train_loader, verbose=(args.gpu == 0))
 
         if args.gpu == 0:
+            (
+                balanced_accuracy,
+                accuracy,
+                f1_weighted,
+                f1_macro,
+                precision_macro,
+                precision_weighted,
+            ) = trainer.evaluate(val_loader, **vars(args))
+
             print(
                 "\n",
                 time.strftime("%Y-%m-%d %H:%M:%S"),
-                "Epoch {:d}, TEER/TAcc {:2.2f}, TLOSS {:f}, LR {:f}".format(
-                    it, traineer.item(), loss.item(), max(clr)
+                "Epoch {:d}, TLOSS {:f}, LR {:f}, balanced_accuracy {:2.3f} "
+                "accuracy {:2.3f} f1_weighted {:2.3f} f1_macro {:2.3f} "
+                "precision_macro {:2.3f} precision_weighted {:2.3f}".format(
+                    it,
+                    loss,
+                    max(clr),
+                    balanced_accuracy,
+                    accuracy,
+                    f1_weighted,
+                    f1_macro,
+                    precision_macro,
+                    precision_weighted,
                 ),
             )
             scorefile.write(
-                "Epoch {:d}, TEER/TAcc {:2.2f}, TLOSS {:f}, LR {:f} \n".format(
-                    it, traineer.item(), loss.item(), max(clr)
+                "Epoch {:d}, TLOSS {:f}, LR {:f} balanced_accuracy {:2.3f} "
+                "accuracy {:2.3f} f1_weighted {:2.3f} f1_macro {:2.3f} "
+                "precision_macro {:2.3f} precision_weighted {:2.3f}".format(
+                    it,
+                    loss,
+                    max(clr),
+                    balanced_accuracy,
+                    accuracy,
+                    f1_weighted,
+                    f1_macro,
+                    precision_macro,
+                    precision_weighted,
                 )
             )
 
-        if it % args.test_interval == 0:
+            if balanced_accuracy > best_balanced_accuracy:
+                best_balanced_accuracy = balanced_accuracy
+                best_ckpt_path = args.model_save_path + "/model%09d.model" % it
 
-            # sc, lab, _, as1, as2 = trainer.evaluateFromList(**vars(args))
+            trainer.saveParameters(args.model_save_path + "/model%09d.model" % it)
 
-            if args.gpu == 0:
-                trainer.saveParameters(args.model_save_path + "/model%09d.model" % it)
-
-                scorefile.flush()
+            scorefile.flush()
 
         if ("nsml" in sys.modules) and args.gpu == 0:
-            training_report = {}
-            training_report["summary"] = True
-            training_report["epoch"] = it
-            training_report["step"] = it
-            training_report["train_loss"] = loss
-            training_report["min_eer"] = min(eers)
-
+            training_report = {
+                "summary": True,
+                "epoch": it,
+                "step": it,
+                "train_loss": loss,
+            }
             nsml.report(**training_report)
 
+    # Testing and closing file
     if args.gpu == 0:
+        trainer.loadParameters(best_ckpt_path)
+        (
+            balanced_accuracy,
+            accuracy,
+            f1_weighted,
+            f1_macro,
+            precision_macro,
+            precision_weighted,
+        ) = trainer.evaluate(test_loader, **vars(args))
+
+        print(
+            "\n",
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            "Ckpt path {:s}, test_balanced_accuracy {:2.3f} "
+            "test_accuracy {:2.3f} test_f1_weighted {:2.3f} test_f1_macro {:2.3f} "
+            "test_precision_macro {:2.3f} test_precision_weighted {:2.3f}".format(
+                best_ckpt_path,
+                balanced_accuracy,
+                accuracy,
+                f1_weighted,
+                f1_macro,
+                precision_macro,
+                precision_weighted,
+            ),
+        )
+        scorefile.write(
+            "Ckpt path {:s}, test_balanced_accuracy {:2.3f} "
+            "test_accuracy {:2.3f} test_f1_weighted {:2.3f} test_f1_macro {:2.3f} "
+            "test_precision_macro {:2.3f} test_precision_weighted {:2.3f}\n".format(
+                best_ckpt_path,
+                balanced_accuracy,
+                accuracy,
+                f1_weighted,
+                f1_macro,
+                precision_macro,
+                precision_weighted,
+            )
+        )
+
         scorefile.close()
+        if not args.save_ckpts:
+            rmtree(args.model_save_path)
 
 
 ## ===== ===== ===== ===== ===== ===== ===== =====
@@ -507,28 +550,68 @@ def main_worker(gpu, ngpus_per_node, args):
 ## ===== ===== ===== ===== ===== ===== ===== =====
 
 
+def find_free_port() -> int:
+    """
+    Find a free port for dist url
+    :return:
+    """
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+
+    return port
+
+
 def main():
     if ("nsml" in sys.modules) and not args.eval:
         args.save_path = os.path.join(args.save_path, SESSION_NAME.replace("/", "_"))
+    args.save_path = args.save_path + (
+        f"weight_finetuning_reg_{args.weight_finetuning_reg}_"
+        f"LLRD_factor_{args.LLRD_factor}_"
+        f"LR_Transformer_{args.LR_Transformer}_"
+        f"LR_MHFA_{args.LR_MHFA}_"
+        f"head_nb_{args.head_nb}_"
+        f"batch_size_{args.batch_size}_"
+        f"eval_session_{args.eval_session}_"
+        f"test_gender_{args.test_gender}"
+    )
 
-    args.model_save_path = args.save_path + "/model"
-    args.result_save_path = args.save_path + "/result"
-    args.feat_save_path = ""
+    if not Path(str(args.save_path)).exists():
+        args.model_save_path = args.save_path + "/model"
+        args.result_save_path = args.save_path + "/result"
+        args.feat_save_path = ""
 
-    os.makedirs(args.model_save_path, exist_ok=True)
-    os.makedirs(args.result_save_path, exist_ok=True)
+        os.makedirs(args.model_save_path, exist_ok=True)
+        os.makedirs(args.result_save_path, exist_ok=True)
 
-    n_gpus = torch.cuda.device_count()
+        n_gpus = torch.cuda.device_count()
 
-    print("Python Version:", sys.version)
-    print("PyTorch Version:", torch.__version__)
-    print("Number of GPUs:", torch.cuda.device_count())
-    print("Save path:", args.save_path)
+        print("Python Version:", sys.version)
+        print("PyTorch Version:", torch.__version__)
+        print("Number of GPUs:", torch.cuda.device_count())
+        print("Save path:", args.save_path)
 
-    if args.distributed:
-        mp.spawn(main_worker, nprocs=n_gpus, args=(n_gpus, args))
+        if args.distributed:
+            print(f"Using distributed training.")
+
+            free_port = find_free_port()
+            dist_url = f"tcp://127.0.0.1:{free_port}"
+
+            # Create processes
+            processes = []
+            for rank in range(torch.cuda.device_count()):
+                p = mp.Process(target=main_worker, args=(rank, n_gpus, dist_url, args))
+                p.start()
+                processes.append(p)
+
+            # Join processes
+            for p in processes:
+                p.join()
+            # mp.spawn(fn=main_worker, nprocs=n_gpus, args=(n_gpus, args))
+        else:
+            main_worker(0, 1, None, args)
     else:
-        main_worker(0, None, args)
+        print(f"{args.save_path} exist!")
 
 
 if __name__ == "__main__":

@@ -3,8 +3,9 @@
 
 import torch
 
+
 def Optimizer(parameters, lr, **kwargs):
 
-	print('Initialised Adam optimizer')
+    print("Initialised Adam optimizer")
 
-	return torch.optim.Adam(parameters, lr = lr);
+    return torch.optim.Adam(parameters, lr=lr)
