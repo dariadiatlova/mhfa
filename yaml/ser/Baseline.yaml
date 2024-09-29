@@ -1,18 +1,19 @@
 max_epoch: 15
+batch_size: 4
 
 ## Training details
 trainfunc: crossentropy
 
 classes: [0, 1, 2, 3]
-pretrained_model_path: /app/data/wav-lm/WavLM-Large.pt
+pretrained_model_path: /app/nfs_small/wav-lm/WavLM-Large.pt
 
 ## Loss functions
 nClasses: 4
+nOut: None
 
 ## Load and save
-train_path: /app/data
-train_list: /app/data/csv/dialog_10fold.csv
-random_crop: True
+train_path: /app/nfs_small
+train_list: /app/nfs_small/csv/dialog_10fold.csv
 
 ## Model definition
 model: Baseline.Spk_Encoder

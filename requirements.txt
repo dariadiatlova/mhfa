@@ -1,9 +1,7 @@
-numpy==2.1.0
 scikit_learn==1.5.1
 scipy==1.14.1
 soundfile==0.12.1
+pandas==2.2.1
 ipython
 jupyter
-wandb
-pandas
 torchaudio

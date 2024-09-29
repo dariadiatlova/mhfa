@@ -159,6 +159,12 @@ parser.add_argument(
     help="Number of speakers in the softmax layer, only for softmax-based losses",
 )
 
+parser.add_argument(
+    "--nOut",
+    default=None,
+    help="Number of final embedding (None if using n classes)",
+)
+
 ## Evaluation parameters
 parser.add_argument(
     "--dcf_p_target",
@@ -180,7 +186,7 @@ parser.add_argument(
 parser.add_argument(
     "--save_path",
     type=str,
-    default="/app/data2/mhfa_training_logs",
+    default="/app/nfs_small/mhfa_training_logs/",
     help="Path for model and logs",
 )
 
@@ -223,6 +229,13 @@ parser.add_argument(
     default=16,
     help="Number of heads in MHFA",
 )
+parser.add_argument(
+    "--accumulate_grad_each_n_step",
+    type=int,
+    default=1,
+    help="Accumulate gradient each n step",
+)
+
 
 ## Model definition
 parser.add_argument("--n_mels", type=int, default=80, help="Number of mel filterbanks")
@@ -571,7 +584,7 @@ def main():
         f"LR_Transformer_{args.LR_Transformer}_"
         f"LR_MHFA_{args.LR_MHFA}_"
         f"head_nb_{args.head_nb}_"
-        f"batch_size_{args.batch_size}_"
+        f"batch_size_{args.batch_size * args.accumulate_grad_each_n_step}_"
         f"eval_session_{args.eval_session}_"
         f"test_gender_{args.test_gender}"
     )

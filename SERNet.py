@@ -48,9 +48,9 @@ class SERNet(nn.Module):
         self.weight_finetuning_reg = kwargs["weight_finetuning_reg"]
 
     def forward(self, data, l2_reg_dict, return_prediction):
-        waveform = torch.cat(data["waveform"], dim=0).to("cuda")
-        padding_mask = torch.cat(data["padding_mask"], dim=0).to("cuda")
-        label = torch.cat(data["emotion"], dim=0).to("cuda")
+        waveform = data["waveform"].to("cuda")
+        padding_mask = data["padding_mask"].to("cuda")
+        label = data["emotion"].to("cuda")
         outp = self.__S__.forward(waveform, padding_mask)
         loss = self.__L__.forward(outp, label)
 
@@ -83,8 +83,16 @@ class ModelTrainer(object):
         Backend_params = filter(
             lambda p: id(p) not in WavLM_params, self.__model__.module.parameters()
         )
+        backend_params_names = [
+            n
+            for n, p in self.__model__.module.named_parameters()
+            if id(p) not in WavLM_params
+        ]
         self.path = kwargs["pretrained_model_path"]
-
+        self.accumulate_gradient_each_n_step = kwargs["accumulate_grad_each_n_step"]
+        # print("Parameters in optim: \n",
+        #     backend_params_names
+        # )
         Optimizer = importlib.import_module("optimizer." + optimizer).__getattribute__(
             "Optimizer"
         )
@@ -142,14 +150,21 @@ class ModelTrainer(object):
             else:
                 newname = name
             Learned_dict[newname] = param
+        torch.set_grad_enabled(True)
+        self.__model__.zero_grad()
         for i, data in enumerate(loader):
-            self.__model__.zero_grad()
             total_loss, ce_loss = self.__model__(
                 data, Learned_dict, return_prediction=False
             )
+            total_loss = total_loss / self.accumulate_gradient_each_n_step
 
             total_loss.backward()
-            self.__optimizer__.step()
+            if i % self.accumulate_gradient_each_n_step == 0:
+                # print(f"Did optimizer step!")
+                self.__optimizer__.step()
+                self.__model__.zero_grad()
+                if self.lr_step == "iteration":
+                    self.__scheduler__.step()
 
             # Ensure total_loss is a scalar
             if total_loss.dim() == 0:
@@ -163,14 +178,11 @@ class ModelTrainer(object):
             tstart = time.time()
 
             if verbose:
-                sys.stdout.write("\rProcessing (%d) " % (index))
+                sys.stdout.write("\rProcessing (%d) " % i)
                 sys.stdout.write(
                     "Loss %f - %.2f Hz " % (loss / counter, stepsize / telapsed)
                 )
                 sys.stdout.flush()
-
-            if self.lr_step == "iteration":
-                self.__scheduler__.step()
 
         if self.lr_step == "epoch":
             self.__scheduler__.step()
@@ -216,7 +228,7 @@ class ModelTrainer(object):
                 .cpu()
                 .tolist()
             )
-            targets = torch.cat(data["emotion"], dim=0).tolist()
+            targets = data["emotion"].tolist()
             predicted_labels.extend(predictions)
             target_labels.extend(targets)
             loss += total_loss
@@ -227,6 +239,8 @@ class ModelTrainer(object):
         assert len(target_labels) == len(predicted_labels), (
             f"Expected to gather equal amount of targets and " f"predictions."
         )
+        # print(f"target_labels: {target_labels}")
+        # print(f"predicted_labels: {predicted_labels}")
         balanced_accuracy = balanced_accuracy_score(target_labels, predicted_labels)
         accuracy = accuracy_score(target_labels, predicted_labels)
         f1_weighted = f1_score(

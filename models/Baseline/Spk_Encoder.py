@@ -41,6 +41,10 @@ class MHFA(nn.Module):
 
     def forward(self, x, padding_mask=None):
         # Input x has shape: [Batch, Dim, Frame_len, Nb_Layer]
+        #
+        # print(f"self.weights_k: {self.weights_k}")
+        # print(f"self.weights_v: {self.weights_v}")
+        # print(f"self.att_head: {self.att_head.weight}")
 
         # Compute the key by taking a weighted sum of input across layers
         k = torch.sum(
@@ -61,13 +65,17 @@ class MHFA(nn.Module):
 
         # Adjust dimensions for computing attention output
         v = v.unsqueeze(-2)
-        padding_mask_expanded = padding_mask.unsqueeze(-1).expand_as(att_k)
-        att_k_masked = att_k.masked_fill(padding_mask_expanded, -np.inf)
-
-        # Compute attention output by taking weighted sum of values using softmaxed attention weights
-        pooling_outs = torch.sum(
-            v.mul(nn.functional.softmax(att_k_masked, dim=1).unsqueeze(-1)), dim=1
-        )
+        if padding_mask is not None:
+            padding_mask_expanded = padding_mask.unsqueeze(-1).expand_as(att_k)
+            att_k_masked = att_k.masked_fill(padding_mask_expanded, -np.inf)
+            # Compute attention output by taking weighted sum of values using softmaxed attention weights
+            pooling_outs = torch.sum(
+                v.mul(nn.functional.softmax(att_k_masked, dim=1).unsqueeze(-1)), dim=1
+            )
+        else:
+            pooling_outs = torch.sum(
+                v.mul(nn.functional.softmax(att_k, dim=1).unsqueeze(-1)), dim=1
+            )
 
         # Reshape the tensor before passing through the fully connected layer
         b, h, f = pooling_outs.shape
@@ -92,11 +100,12 @@ class spk_extractor(nn.Module):
             head_nb=kwargs["head_nb"],
             inputs_dim=self.cfg["encoder_embed_dim"],
             n_layers=self.cfg["encoder_layers"],
-            outputs_dim=kwargs["nClasses"],
+            outputs_dim=(
+                kwargs["nClasses"] if kwargs["nOut"] is None else kwargs["nOut"]
+            ),
         )
 
     def forward(self, wav, padding_mask=None):
-
         x = wav
         cnn_outs, layer_results = self.model.extract_features(
             x, output_layer=self.cfg["encoder_layers"], padding_mask=padding_mask

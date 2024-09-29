@@ -3,10 +3,7 @@
 # Adapted from https://github.com/wujiyang/Face_Pytorch (Apache License)
 
 import math
-import pdb
-import time
 
-import numpy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,8 +25,9 @@ class LossFunction(nn.Module):
         self.weight = torch.nn.Parameter(
             torch.FloatTensor(nClasses, nOut), requires_grad=True
         )
+
         self.ce = nn.CrossEntropyLoss()
-        nn.init.xavier_normal_(self.weight, gain=1)
+        # nn.init.xavier_normal_(self.weight, gain=1)
 
         self.easy_margin = easy_margin
         self.cos_m = math.cos(self.m)
@@ -62,7 +60,6 @@ class LossFunction(nn.Module):
         one_hot.scatter_(1, label.view(-1, 1), 1)
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
         output = output * self.s
-
-        loss = self.ce(output, label)
+        loss = self.ce(output, label.squeeze(1))
         prec1 = accuracy(output.detach(), label.detach(), topk=(1,))[0]
         return loss, prec1

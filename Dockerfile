@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:24.05-py3
+FROM nvcr.io/nvidia/pytorch:23.09-py3
 
 WORKDIR /app
 COPY requirements.txt requirements.txt

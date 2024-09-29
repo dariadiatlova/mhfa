@@ -40,13 +40,13 @@ parser.add_argument(
 parser.add_argument(
     "--eval_frames",
     type=int,
-    default=300,
+    default=0,
     help="Input length to the network for testing; 0 uses the whole files",
 )
 parser.add_argument(
     "--batch_size",
     type=int,
-    default=400,
+    default=32,
     help="Batch size, number of speakers per batch",
 )
 parser.add_argument(
@@ -56,7 +56,7 @@ parser.add_argument(
     help="Maximum number of utterances per speaker per epoch",
 )
 parser.add_argument(
-    "--nDataLoaderThread", type=int, default=10, help="Number of loader threads"
+    "--nDataLoaderThread", type=int, default=1, help="Number of loader threads"
 )
 parser.add_argument("--augment", type=bool, default=True, help="Augment input")
 parser.add_argument(

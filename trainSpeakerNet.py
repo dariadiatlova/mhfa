@@ -1,4 +1,4 @@
-#!/usr/bin/python
+# !/usr/bin/python
 # -*- coding: utf-8 -*-
 
 import argparse
@@ -11,6 +11,8 @@ import sys
 import time
 import warnings
 import zipfile
+from pathlib import Path
+from shutil import rmtree
 
 import numpy
 import torch
@@ -19,14 +21,13 @@ import torch.multiprocessing as mp
 
 import yaml
 from DatasetLoader import *
-from ser_dataset_loader import *
 from SpeakerNet import *
 from tuneThreshold import *
 
 ## ===== ===== ===== ===== ===== ===== ===== =====
 ## Parse arguments
 ## ===== ===== ===== ===== ===== ===== ===== =====
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 parser = argparse.ArgumentParser(description="SpeakerNet")
 
@@ -42,7 +43,7 @@ parser.add_argument(
 parser.add_argument(
     "--eval_frames",
     type=int,
-    default=300,
+    default=0,
     help="Input length to the network for testing; 0 uses the whole files",
 )
 parser.add_argument(
@@ -121,6 +122,7 @@ parser.add_argument(
     default=5e-3,
     help="Learning rate of back-end attentive pooling model",
 )
+parser.add_argument("--head_nb", type=int, default=16, help="Number of heads in MHFA")
 
 ## Loss functions
 parser.add_argument(
@@ -178,6 +180,9 @@ parser.add_argument(
 parser.add_argument(
     "--save_path", type=str, default="exps/exp1", help="Path for model and logs"
 )
+parser.add_argument(
+    "--save_ckpts", type=bool, default=True, help="Save or delete ckpts"
+)
 
 ## Training and test data
 ## Training and test data
@@ -186,6 +191,12 @@ parser.add_argument(
     type=str,
     default="/mnt/proj3/open-24-5/pengjy_new/WavLM/vox_list/train_list.txt",
     help="Train list",
+)
+parser.add_argument(
+    "--val_list",
+    type=str,
+    default="/mnt/proj3/open-24-5/pengjy_new/WavLM/vox_list/train_list.txt",
+    help="Val list",
 )
 parser.add_argument(
     "--test_list",
@@ -218,32 +229,11 @@ parser.add_argument(
     default="/mnt/proj3/open-24-5/plchot/data_augment/16kHz/simulated_rirs/",
     help="Absolute path to the test set",
 )
-
-# SER
 parser.add_argument(
-    "--eval_session",
-    type=str,
-    default="Ses05",
-    help="Session that will not be used in training.",
-)
-parser.add_argument(
-    "--test_gender",
-    type=str,
-    default="M",
-    help="Speaker of the eval session that will be used for testing, other for evaluation (male - M or female - F)",
-)
-
-parser.add_argument(
-    "--ds_size",
+    "--size",
     type=int,
-    default=16,
-    help="Size of the dataset used for training and evaluation",
-)
-parser.add_argument(
-    "--head-nb",
-    type=int,
-    default=16,
-    help="Number of heads in MHFA",
+    default=None,
+    help="if None all samples are used for dataset creation",
 )
 
 ## Model definition
@@ -257,9 +247,6 @@ parser.add_argument(
 
 ## For test only
 parser.add_argument("--eval", dest="eval", action="store_true", help="Eval only")
-
-## If train for Speech Emotion Recognition
-parser.add_argument("--ser", dest="ser", action="store_true", help="If train for SER")
 
 ## Distributed and mixed precision training
 parser.add_argument(
@@ -346,38 +333,39 @@ def main_worker(gpu, ngpus_per_node, args):
 
     it = 1
     eers = [100]
+    best_eer = 0.0
+    best_ckpt_path = None
 
     if args.gpu == 0:
         ## Write args to scorefile
         scorefile = open(args.result_save_path + "/scores.txt", "a+")
 
     ## Initialise trainer and data loader
-    if args.ser:
-        dataloader_factory = DataloaderFactory(args)
-        train_loader = dataloader_factory.build(
-            size=args.ds_size, state="train", bs=args.batch_size
-        )
-        val_loader = dataloader_factory.build(
-            size=args.ds_size, state="val", bs=args.batch_size
-        )
-        test_loader = dataloader_factory.build(
-            size=args.ds_size, state="test", bs=args.batch_size
-        )
-    else:
-        train_dataset = train_dataset_loader(**vars(args))
-        train_sampler = train_dataset_sampler(train_dataset, **vars(args))
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            num_workers=args.nDataLoaderThread,
-            sampler=train_sampler,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn,
-            drop_last=True,
-        )
-
+    train_dataset = train_dataset_loader(**vars(args))
+    train_sampler = train_dataset_sampler(train_dataset, **vars(args))
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        # num_workers=args.nDataLoaderThread,
+        sampler=train_sampler,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+        drop_last=True,
+    )
     # trainLoader = get_data_loader(args.train_list, **vars(args));
     trainer = ModelTrainer(s, **vars(args))
+
+    # val_dataset = train_dataset_loader(**vars(args), val=True)
+    # val_sampler = train_dataset_sampler(val_dataset, **vars(args))
+    # val_loader = torch.utils.data.DataLoader(
+    #     val_dataset,
+    #     batch_size=args.batch_size,
+    #     # num_workers=args.nDataLoaderThread,
+    #     sampler=val_sampler,
+    #     pin_memory=True,
+    #     worker_init_fn=worker_init_fn,
+    #     drop_last=True,
+    # )
 
     ## Load model weights
     modelfiles = glob.glob("%s/model0*.model" % args.model_save_path)
@@ -397,45 +385,32 @@ def main_worker(gpu, ngpus_per_node, args):
     pytorch_total_params = sum(p.numel() for p in s.module.__S__.parameters())
 
     print("Total parameters: ", pytorch_total_params)
-    ## Evaluation code - must run on single GPU
-    if args.eval == True:
+    # Evaluation code - must run on single GPU
+    if args.eval:
 
         print("Test list", args.test_list)
 
-        sc, lab, _, sc1, sc2 = trainer.evaluateFromList(**vars(args))
-
         if args.gpu == 0:
-
-            result = tuneThresholdfromScore(sc, lab, [1, 0.1])
-            result_s1 = tuneThresholdfromScore(sc1, lab, [1, 0.1])
-            result_s2 = tuneThresholdfromScore(sc2, lab, [1, 0.1])
-
-            fnrs, fprs, thresholds = ComputeErrorRates(sc, lab)
-            mindcf, threshold = ComputeMinDcf(
-                fnrs,
-                fprs,
-                thresholds,
-                args.dcf_p_target,
-                args.dcf_c_miss,
-                args.dcf_c_fa,
-            )
+            eer, mindcf = trainer.evaluateFromList(**vars(args), mode="test")
 
             print(
                 "\n",
-                time.strftime("%Y-%m-%d %H:%M:%S"),
-                "VEER {:2.4f}".format(result[1]),
-                "VEER_s1 {:2.4f}".format(result_s1[1]),
-                "VEER_s2 {:2.4f}".format(result_s2[1]),
+                time.strftime("%Y-%m-%d :%S"),
+                "VEER {:2.4f}".format(eer),
                 "MinDCF {:2.5f}".format(mindcf),
             )
 
+            scorefile.write("VEER {:2.4f} MinDCF {:2.5f}".format(eer, mindcf))
+            scorefile.close()
+
             if ("nsml" in sys.modules) and args.gpu == 0:
-                training_report = {}
-                training_report["summary"] = True
-                training_report["epoch"] = it
-                training_report["step"] = it
-                training_report["val_eer"] = result[1]
-                training_report["val_dcf"] = mindcf
+                training_report = {
+                    "summary": True,
+                    "epoch": it,
+                    "step": it,
+                    "val_eer": eer,
+                    "val_dcf": mindcf,
+                }
 
                 nsml.report(**training_report)
 
@@ -463,19 +438,36 @@ def main_worker(gpu, ngpus_per_node, args):
 
         clr = [x["lr"] for x in trainer.__optimizer__.param_groups]
 
-        loss, traineer = trainer.train_network(train_loader, verbose=(args.gpu == 0))
+        loss, trainacc = trainer.train_network(train_loader, verbose=(args.gpu == 0))
+        # val_loss, valacc = trainer.evaluate_network(val_loader, verbose=(args.gpu == 0))
+
+        if torch.isnan(loss):
+            assert False, "Train loss is None."
+
+        # if torch.isnan(val_loss):
+        #     assert False, "Val loss is None."
 
         if args.gpu == 0:
+            eer, mindcf = trainer.evaluateFromList(**vars(args), mode="val")
             print(
                 "\n",
                 time.strftime("%Y-%m-%d %H:%M:%S"),
                 "Epoch {:d}, TEER/TAcc {:2.2f}, TLOSS {:f}, LR {:f}".format(
-                    it, traineer.item(), loss.item(), max(clr)
+                    it, trainacc.item(), loss.item(), max(clr)
                 ),
             )
+
+            print(
+                "\n",
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                "Epoch {:d}, VEER {:2.4f}, MinDCF {:2.5f}, LR {:f}".format(
+                    it, eer, mindcf, max(clr)
+                ),
+            )
+
             scorefile.write(
-                "Epoch {:d}, TEER/TAcc {:2.2f}, TLOSS {:f}, LR {:f} \n".format(
-                    it, traineer.item(), loss.item(), max(clr)
+                "Epoch {:d}, VEER {:2.4f}, MinDCF {:2.5f}, LR {:f} \n".format(
+                    it, eer, mindcf, max(clr)
                 )
             )
 
@@ -484,6 +476,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # sc, lab, _, as1, as2 = trainer.evaluateFromList(**vars(args))
 
             if args.gpu == 0:
+                if eer < best_eer:
+                    best_eer = eer
+                    best_ckpt_path = args.model_save_path + "/model%09d.model" % it
                 trainer.saveParameters(args.model_save_path + "/model%09d.model" % it)
 
                 scorefile.flush()
@@ -499,7 +494,10 @@ def main_worker(gpu, ngpus_per_node, args):
             nsml.report(**training_report)
 
     if args.gpu == 0:
+        scorefile.write(f"BestPath: {best_ckpt_path}, BestAcc: {best_eer}")
         scorefile.close()
+        if not args.save_ckpts:
+            rmtree(args.model_save_path)
 
 
 ## ===== ===== ===== ===== ===== ===== ===== =====
@@ -511,24 +509,36 @@ def main():
     if ("nsml" in sys.modules) and not args.eval:
         args.save_path = os.path.join(args.save_path, SESSION_NAME.replace("/", "_"))
 
-    args.model_save_path = args.save_path + "/model"
-    args.result_save_path = args.save_path + "/result"
-    args.feat_save_path = ""
+    args.save_path = args.save_path + (
+        f"LLRD_factor_{args.LLRD_factor}_"
+        f"LR_Transformer_{args.LR_Transformer}_"
+        f"LR_MHFA_{args.LR_MHFA}_"
+        f"batch_size_{args.batch_size}_"
+        f"seed_{args.seed}_"
+        f"weight_finetuning_reg{args.weight_finetuning_reg}"
+    )
 
-    os.makedirs(args.model_save_path, exist_ok=True)
-    os.makedirs(args.result_save_path, exist_ok=True)
+    if not Path(str(args.save_path)).exists():
+        args.model_save_path = args.save_path + "/model"
+        args.result_save_path = args.save_path + "/result"
+        args.feat_save_path = ""
 
-    n_gpus = torch.cuda.device_count()
+        os.makedirs(args.model_save_path, exist_ok=True)
+        os.makedirs(args.result_save_path, exist_ok=True)
 
-    print("Python Version:", sys.version)
-    print("PyTorch Version:", torch.__version__)
-    print("Number of GPUs:", torch.cuda.device_count())
-    print("Save path:", args.save_path)
+        n_gpus = torch.cuda.device_count()
 
-    if args.distributed:
-        mp.spawn(main_worker, nprocs=n_gpus, args=(n_gpus, args))
+        print("Python Version:", sys.version)
+        print("PyTorch Version:", torch.__version__)
+        print("Number of GPUs:", torch.cuda.device_count())
+        print("Save path:", args.save_path)
+
+        if args.distributed:
+            mp.spawn(main_worker, nprocs=n_gpus, args=(n_gpus, args))
+        else:
+            main_worker(0, None, args)
     else:
-        main_worker(0, None, args)
+        print(f"{Path(str(args.save_path))} exists.")
 
 
 if __name__ == "__main__":

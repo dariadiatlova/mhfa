@@ -4,6 +4,7 @@ from random import randrange
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -45,13 +46,41 @@ def universal_dict_collater(batch):
     return all_data
 
 
+def pad_collate_fn(batch):
+    max_length = max(sample["waveform"].shape[-1] for sample in batch)
+
+    for sample in batch:
+        waveform = sample["waveform"]
+        length = waveform.shape[-1]
+        if length < max_length:
+            padding_length = max_length - length
+            waveform = F.pad(waveform, (0, padding_length), "constant", value=0.0)
+        sample["waveform"] = waveform
+
+        # Create padding mask
+        padding_mask = torch.full((1, max_length), fill_value=False, dtype=torch.bool)
+        if length < max_length:
+            padding_mask[:, -padding_length:] = True
+        sample["padding_mask"] = padding_mask.long()
+
+    waveforms = torch.stack([sample["waveform"] for sample in batch]).squeeze(1)
+    padding_masks = torch.stack([sample["padding_mask"] for sample in batch]).squeeze(1)
+    emotions = torch.stack([sample["emotion"] for sample in batch]).squeeze(1)
+
+    return {
+        "waveform": waveforms,
+        "padding_mask": padding_masks,
+        "emotion": emotions,
+    }
+
+
 class DataloaderFactory:
     def __init__(self, args):
         self.args = args
 
     def build(self, size, state: str = "train", bs: int = 1):
         dataset = IemocapDataset(args=self.args, state=state, size=size)
-        collate_fn = universal_dict_collater
+        collate_fn = pad_collate_fn
         if self.args.distributed:
             sampler = DistributedSampler(dataset, shuffle=state == "train")
         else:
@@ -74,69 +103,28 @@ class DataloaderFactory:
 
 class DownstreamDataset(Dataset):
     def __init__(
-        self,
-        df,
-        wavdir,
-        batch_length,
-        col_sample="file_path",
-        col_label="label",
-        random_crop=True,
-        size=None,
+        self, df, wavdir, col_sample="file_path", col_label="label", size=None
     ):
         self.df = df
         self.wavdir = wavdir
-        self.batch_length = batch_length
         self.col_sample = col_sample
         self.col_label = col_label
-        self.random_crop = random_crop
         self.size = size
 
     def __len__(self):
         return len(self.df) if self.size is None else self.size
 
-    def _random_crop(self, waveform):
-        max_start_index = waveform.shape[1] - self.batch_length
-        try:
-            random_start = randrange(max_start_index)
-        except Exception as e:
-            print(e)
-            print(f"Shape: {waveform.shape[1]}, start index: {max_start_index}")
-        cropped_waveform = waveform[:, random_start : random_start + self.batch_length]
-        assert cropped_waveform.shape[1] == self.batch_length, (
-            f"Expected cropped shape to be {self.batch_length}, "
-            f"got: {cropped_waveform.shape[1]}, "
-            f"start index: {random_start}"
-        )
-        return cropped_waveform
-
     def __getitem__(self, idx):
-        filename = self.df.loc[idx, self.col_sample]  # .split("/")[-1]
+        filename = self.df.loc[idx, self.col_sample]
         waveform = torch.load(f"{self.wavdir}{filename}")
         if len(waveform.shape) == 1:
             waveform = waveform.unsqueeze(0)
         emotion = torch.tensor(
             [int(self.df.loc[idx, self.col_label])], dtype=torch.long
         )
-        padding_mask = torch.full(
-            (1, self.batch_length), fill_value=False, dtype=torch.bool
-        )
-
-        length = waveform.shape[-1]
-        if length > self.batch_length:
-            if self.random_crop:
-                waveform = self._random_crop(waveform)  # train
-            else:
-                waveform = waveform[:, : self.batch_length]  # validation
-        elif length < self.batch_length:
-            padding_length = self.batch_length - length
-            waveform = torch.nn.functional.pad(
-                waveform, (0, padding_length), "constant", value=0.0
-            )
-            padding_mask[:, -padding_length:] = True
 
         sample = {
             "waveform": waveform,
-            "padding_mask": padding_mask,
             "emotion": emotion,
         }
 
@@ -172,9 +160,7 @@ class IemocapDataset(DownstreamDataset):
         super().__init__(
             df,
             wavdir,
-            batch_length,
             col_sample="file_path",
             col_label="emotion",
-            random_crop=args.random_crop if state == "train" else False,
             size=size,
         )

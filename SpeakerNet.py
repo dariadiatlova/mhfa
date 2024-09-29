@@ -2,7 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import importlib
+import itertools
+import math
+import os
+import pdb
+import pickle
 import random
+import shutil
 import sys
 import time
 
@@ -10,8 +16,19 @@ import numpy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from DatasetLoader import test_dataset_loader
+from metrics import get_eer, get_min_c
+from tuneThreshold import tuneThresholdfromScore
+
+
+def check_for_nans(model):
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any():
+            print(f"NaN detected in parameter: {name}")
+        else:
+            print(f"No NaNs in parameter: {name}")
 
 
 class WrappedModel(nn.Module):
@@ -22,8 +39,8 @@ class WrappedModel(nn.Module):
         super(WrappedModel, self).__init__()
         self.module = model
 
-    def forward(self, x, label=None, l2_reg_dict=None):
-        return self.module(x, label)
+    def forward(self, data, mask, label=None, l2_reg_dict=None):
+        return self.module(data, mask, label, l2_reg_dict)
 
 
 class SpeakerNet(nn.Module):
@@ -44,14 +61,16 @@ class SpeakerNet(nn.Module):
         self.nPerSpeaker = nPerSpeaker
         self.weight_finetuning_reg = kwargs["weight_finetuning_reg"]
 
-    def forward(self, data, label=None, l2_reg_dict=None):
+    def forward(self, data, mask, label=None, l2_reg_dict=None):
         if label is None:
-            data_reshape = data[0].cuda()
-            outp = self.__S__.forward([data_reshape, data[1]])
+            # data_reshape = data[0].cuda()
+            outp = self.__S__.forward(wav=data[0], padding_mask=mask)
             return outp
         else:
-            data_reshape = data[0].reshape(-1, data[0].size()[-1]).cuda()
-            outp = self.__S__.forward([data_reshape, data[1]])
+            # data_reshape = data[0].reshape(-1, data[0].size()[-1]).cuda()
+            # print(f"data_reshape.shape: {data_reshape.shape}")
+            # outp = self.__S__.forward([data_reshape, data[1]])
+            outp = self.__S__.forward(wav=data[0], padding_mask=mask)
             nloss, prec1 = self.__L__.forward(outp, label)
 
             if l2_reg_dict is not None:
@@ -68,7 +87,6 @@ class SpeakerNet(nn.Module):
             else:
                 tloss = nloss
                 # print("Without L2 Reg")
-
             return tloss, prec1, nloss
 
 
@@ -145,15 +163,27 @@ class ModelTrainer(object):
                 newname = name
             Learned_dict[newname] = param
 
-        for data, data_label in loader:
-
-            data = data.transpose(1, 0)
+        # for i, data in tqdm(
+        #         enumerate(loader),
+        #         total=len(loader),
+        #         desc="Iterating through epoch...",
+        #         leave=True,
+        #         disable=not verbose
+        # ):
+        for i, data in enumerate(loader):
+            # if i > 10:
+            #     break
+            # data = data.transpose(1, 0)
             self.__model__.zero_grad()
-            label = torch.LongTensor(data_label).cuda()
-
-            nloss, prec1, spkloss = self.__model__([data, "train"], label, Learned_dict)
-
-            nloss.backward()
+            # label = data_label[0].cuda() #[bs, 1]
+            tloss, prec1, spkloss = self.__model__(
+                data=[data[0].cuda(), "train"],
+                mask=data[1].cuda(),
+                label=data[2].cuda(),
+                l2_reg_dict=Learned_dict,
+            )  # data: [bs, n_samples]
+            torch.nn.utils.clip_grad_norm_(self.__model__.parameters(), 1)
+            tloss.backward()
 
             self.__optimizer__.step()
 
@@ -182,6 +212,65 @@ class ModelTrainer(object):
 
         sys.stdout.write("\n")
 
+        return (loss / counter, top1 / counter)
+
+    # ## ===== ===== ===== ===== ===== ===== ===== =====
+    # ## Evaluate network
+    # ## ===== ===== ===== ===== ===== ===== ===== =====
+    @torch.no_grad()
+    def evaluate_network(self, loader, verbose):
+
+        self.__model__.eval()
+        stepsize = loader.batch_size
+
+        counter = 0
+        index = 0
+        loss = 0
+        top1 = 0  # EER or accuracy
+
+        tstart = time.time()
+        Learned_dict = {}
+        checkpoint = torch.load(self.path)
+        for name, param in checkpoint["model"].items():
+            if "w2v_encoder.w2v_model." in name:
+                newname = name.replace("w2v_encoder.w2v_model.", "")
+            else:
+                newname = name
+            Learned_dict[newname] = param
+
+        # for i, data in tqdm(
+        #         enumerate(loader),
+        #         total=len(loader),
+        #         desc="Iterating through validation epoch...",
+        #         leave=True,
+        #         disable=verbose
+        # ):
+        for i, data in enumerate(loader):
+            nloss, prec1, spkloss = self.__model__(
+                data=[data[0].cuda(), "train"],
+                mask=data[1].cuda(),
+                label=data[2].cuda(),
+                l2_reg_dict=Learned_dict,
+            )  # data: [bs, n_samples]
+            loss += spkloss.detach().cpu()
+            top1 += prec1.detach().cpu()
+
+            counter += 1
+            index += stepsize
+
+            telapsed = time.time() - tstart
+            tstart = time.time()
+
+            if verbose:
+                sys.stdout.write("\rProcessing validation (%d) " % (index))
+                sys.stdout.write(
+                    "Loss %f VEER/VAcc %2.3f%% - %.2f Hz "
+                    % (loss / counter, top1 / counter, stepsize / telapsed)
+                )
+                sys.stdout.flush()
+
+        sys.stdout.write("\n")
+
         return loss / counter, top1 / counter
 
     ## ===== ===== ===== ===== ===== ===== ===== =====
@@ -189,37 +278,13 @@ class ModelTrainer(object):
     ## ===== ===== ===== ===== ===== ===== ===== =====
 
     def evaluateFromList(
-        self,
-        test_list,
-        test_path,
-        nDataLoaderThread,
-        print_interval=10,
-        num_eval=5,
-        **kwargs
+        self, test_list, val_list, mode, nDataLoaderThread, num_eval=5, **kwargs
     ):
 
         self.__model__.eval()
 
-        lines = []
-        files = []
-        feats = {}
-        tstart = time.time()
-
-        ## Read all lines
-        with open(test_list) as f:
-            lines = f.readlines()
-
-        print("After Reading")
-
-        ## Get a list of unique file names
-        files = sum([x.strip().split()[-2:] for x in lines], [])
-        setfiles = list(set(files))
-        setfiles.sort()
-        print("After sorting")
-
-        ## Define test data loader
         test_dataset = test_dataset_loader(
-            setfiles, test_path, num_eval=num_eval, **kwargs
+            test_list if mode == "test" else val_list, num_eval=num_eval, **kwargs
         )
         test_loader = torch.utils.data.DataLoader(
             test_dataset,
@@ -228,106 +293,29 @@ class ModelTrainer(object):
             num_workers=nDataLoaderThread,
             drop_last=False,
         )
-        ref_feat_list = []
-        ref_feat_2_list = []
-        max_len = 0
-        forward = 0
-        ## Extract features for every image
-        for idx, data in enumerate(test_loader):
+        print(f"Len of test loader: {len(test_loader)}")
+        embeddings1 = []
+        embeddings2 = []
+        labels = []
 
+        for idx, data in tqdm(enumerate(test_loader), total=len(test_loader)):
             inp1 = data[0][0].cuda()
             inp2 = data[1][0].cuda()
-            telapsed_2 = time.time()
-            b, utt_l = inp2.shape
-            if utt_l > max_len:
-                max_len = utt_l
-            ref_feat = self.__model__([inp1, "test"]).cuda()
-            ref_feat = ref_feat.detach().cpu()
+            label = data[2]
+
+            ref_feat = self.__model__(
+                data=[inp1, "test"], mask=None, label=None, l2_reg_dict=None
+            ).cuda()
+            embeddings1.append(ref_feat.detach().cpu().numpy())
             ref_feat_2 = self.__model__(
-                [inp2[:, :700000], "test"]
-            ).cuda()  # The reason why here is set to 700000 is due to GPU memory size.
-            ref_feat_2 = ref_feat_2.detach().cpu()
+                data=[inp2, "test"], mask=None, label=None, l2_reg_dict=None
+            ).cuda()
+            embeddings2.append(ref_feat_2.detach().cpu().numpy())
+            labels.append(label.detach().cpu().numpy())
 
-            feats[data[2][0]] = [ref_feat, ref_feat_2]
-
-            ref_feat_list.extend(ref_feat.numpy())
-            ref_feat_2_list.extend(ref_feat_2.numpy())
-
-            telapsed = time.time() - tstart
-            forward = forward + time.time() - telapsed_2
-
-            if idx % print_interval == 0:
-                sys.stdout.write(
-                    "\rReading %d of %d: %.2f Hz, forward speed: %.2f Hz, embedding size %d, max_len %d"
-                    % (
-                        idx,
-                        len(setfiles),
-                        idx / telapsed,
-                        idx / forward,
-                        ref_feat.size()[-1],
-                        max_len,
-                    )
-                )
-
-        print("")
-        all_scores = []
-        all_labels = []
-        all_trials = []
-        all_scores_1 = []
-        all_scores_2 = []
-
-        tstart = time.time()
-
-        ref_feat_list = numpy.array(ref_feat_list)
-        ref_feat_2_list = numpy.array(ref_feat_2_list)
-
-        ref_feat_list_mean = 0
-        ref_feat_2_list_mean = 0
-
-        ## Read files and compute all scores
-        for idx, line in enumerate(lines):
-
-            data = line.split()
-
-            ## Append random label if missing
-            if len(data) == 2:
-                data = [random.randint(0, 1)] + data
-
-            ref_feat, ref_feat_2 = feats[data[1]]
-            com_feat, com_feat_2 = feats[data[2]]
-
-            # if self.__model__.module.__L__.test_normalize:
-            ref_feat = F.normalize(ref_feat - ref_feat_list_mean, p=2, dim=1)  # B, D
-            com_feat = F.normalize(com_feat - ref_feat_list_mean, p=2, dim=1)
-            ref_feat_2 = F.normalize(
-                ref_feat_2 - ref_feat_2_list_mean, p=2, dim=1
-            )  # B, D
-            com_feat_2 = F.normalize(com_feat_2 - ref_feat_2_list_mean, p=2, dim=1)
-
-            score_1 = torch.mean(
-                torch.matmul(ref_feat, com_feat.T)
-            )  # higher is positive
-            score_2 = torch.mean(torch.matmul(ref_feat_2, com_feat_2.T))
-            score = (score_1 + score_2) / 2
-            score = score.detach().cpu().numpy()
-
-            all_scores.append(score)
-            all_scores_1.append(score_1)
-            all_scores_2.append(score_2)
-
-            all_labels.append(int(data[0]))
-            all_trials.append(data[1] + " " + data[2])
-
-            if idx % (10 * print_interval) == 0:
-                telapsed = time.time() - tstart
-                sys.stdout.write(
-                    "\rComputing %d of %d: %.2f Hz" % (idx, len(lines), idx / telapsed)
-                )
-                sys.stdout.flush()
-
-        print("")
-
-        return all_scores, all_labels, all_trials, all_scores_1, all_scores_2
+        dcf = get_min_c(embeddings1, embeddings2, labels)
+        eer = get_eer(embeddings1, embeddings2, labels)
+        return eer, dcf
 
     def saveParameters(self, path):
         torch.save(self.__model__.module.state_dict(), path)
